@@ -1,5 +1,6 @@
-import React, { useState, useEffect } from 'react';
-import { LiveKitRoom, AudioConference, RoomAudioRenderer, StartAudio } from '@livekit/components-react';
+import React, { useState, useEffect, useCallback } from 'react';
+import { LiveKitRoom, AudioConference, RoomAudioRenderer, StartAudio, useRoomContext } from '@livekit/components-react';
+import { RoomEvent } from 'livekit-client';
 import '@livekit/components-styles';
 import './index.css';
 
@@ -11,14 +12,45 @@ function App() {
   const [isConnecting, setIsConnecting] = useState(false);
   const [connectionState, setConnectionState] = useState('disconnected');
 
-  // Backend token server: use env var if provided, otherwise fallback to local dev server
-  const TOKEN_SERVER = import.meta.env.VITE_TOKEN_SERVER || 'http://localhost:8000';
+  // Backend token server: prefer absolute URL in env; otherwise fallback to local dev server
+  const TOKEN_SERVER_ENV = import.meta.env.VITE_TOKEN_SERVER;
+  const TOKEN_SERVER = (
+    TOKEN_SERVER_ENV && /^https?:\/\//.test(TOKEN_SERVER_ENV)
+      ? TOKEN_SERVER_ENV
+      : 'http://localhost:8000'
+  ).replace(/\/+$/, '');
   const LIVEKIT_URL = 'wss://mywifu-vvk52760.livekit.cloud';
+  const ROOM_NAME = 'meera-health-room';
+
+  const startAgent = useCallback(async (who, room) => {
+    try {
+      await fetch(`${TOKEN_SERVER}/agent/start`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ userName: who, roomName: room })
+      });
+    } catch (e) {
+      console.warn('agent/start failed', e);
+    }
+  }, [TOKEN_SERVER]);
+
+  const stopAgent = useCallback(async (who, room) => {
+    try {
+      await fetch(`${TOKEN_SERVER}/agent/stop`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ userName: who, roomName: room })
+      });
+    } catch (e) {
+      console.warn('agent/stop failed', e);
+    }
+  }, [TOKEN_SERVER]);
 
   const connectToMeera = async () => {
     setIsConnecting(true);
     try {
       console.log('🔄 Getting token from backend...');
+      console.log('🔗 Using token server:', TOKEN_SERVER);
       
       // Get token from your deployed backend
       const response = await fetch(`${TOKEN_SERVER}/get-token`, {
@@ -28,7 +60,7 @@ function App() {
         },
         body: JSON.stringify({
           userName: userName,
-          roomName: 'meera-health-room'
+          roomName: ROOM_NAME
         })
       });
 
@@ -46,6 +78,8 @@ function App() {
         setToken(data.token);
         setIsConnected(true);
         setConnectionState('connected');
+        // start backend agent on-demand
+        startAgent(userName, ROOM_NAME);
         
       } else {
         throw new Error('No token received from backend');
@@ -60,6 +94,8 @@ function App() {
   };
 
   const disconnectFromMeera = () => {
+    // stop backend agent on-demand
+    stopAgent(userName, ROOM_NAME);
     setIsConnected(false);
     setToken('');
     setLivekitUrl('');
@@ -69,8 +105,14 @@ function App() {
 
   // Cleanup on unmount
   useEffect(() => {
-    return () => {};
-  }, []);
+    const handler = () => {
+      stopAgent(userName, ROOM_NAME);
+    };
+    window.addEventListener('beforeunload', handler);
+    return () => {
+      window.removeEventListener('beforeunload', handler);
+    };
+  }, [stopAgent, userName]);
 
   if (!isConnected) {
     return (
@@ -85,12 +127,14 @@ function App() {
 
   return (
     <div className="h-screen bg-gradient-to-br from-slate-900 via-fuchsia-950 to-rose-950 text-gray-100">
-      <LiveKitRoom serverUrl={livekitUrl} token={token}>
+      <LiveKitRoom serverUrl={livekitUrl} token={token} connectOptions={{ autoSubscribe: true }}>
         {/* Ensure remote audio tracks are rendered and autoplay is unlocked */}
         <RoomAudioRenderer />
         <div className="fixed top-4 right-4 z-50">
           <StartAudio label="Enable Audio" className="px-3 py-2 rounded-md bg-fuchsia-600 hover:bg-fuchsia-500 text-white shadow" />
         </div>
+
+        <RoomDebugger />
 
         <MeeraInterface
           onDisconnect={disconnectFromMeera}
@@ -297,3 +341,59 @@ function QuickActionButton({ icon, text }) {
 }
 
 export default App;
+
+function RoomDebugger() {
+  const ctx = useRoomContext();
+  const room = ctx?.room;
+
+  useEffect(() => {
+    if (!room) return;
+
+    const logParticipants = () => {
+      const participantMap = room.participants ?? new Map();
+      const remotes = Array.from(participantMap.values()).map((p) => ({
+        identity: p.identity,
+        audioPublications: Array.from(p.audioTrackPublications.values()).map((pub) => ({
+          trackSubscribed: !!pub.track,
+          muted: pub.muted,
+          sid: pub.trackSid,
+        })),
+      }));
+      console.log('👥 Remotes:', remotes);
+    };
+
+    logParticipants();
+
+    const onConnected = () => console.log('🔗 Room connected');
+    const onTrackSubscribed = (track, pub, participant) => {
+      console.log('✅ TrackSubscribed', participant.identity, pub.source, track.kind);
+    };
+    const onTrackUnsubscribed = (_track, pub, participant) => {
+      console.log('🛑 TrackUnsubscribed', participant.identity, pub.source);
+    };
+    const onParticipantConnected = (p) => {
+      console.log('➕ ParticipantConnected', p.identity);
+      logParticipants();
+    };
+    const onParticipantDisconnected = (p) => {
+      console.log('➖ ParticipantDisconnected', p.identity);
+      logParticipants();
+    };
+
+    room.on(RoomEvent.Connected, onConnected);
+    room.on(RoomEvent.TrackSubscribed, onTrackSubscribed);
+    room.on(RoomEvent.TrackUnsubscribed, onTrackUnsubscribed);
+    room.on(RoomEvent.ParticipantConnected, onParticipantConnected);
+    room.on(RoomEvent.ParticipantDisconnected, onParticipantDisconnected);
+
+    return () => {
+      room.off(RoomEvent.Connected, onConnected);
+      room.off(RoomEvent.TrackSubscribed, onTrackSubscribed);
+      room.off(RoomEvent.TrackUnsubscribed, onTrackUnsubscribed);
+      room.off(RoomEvent.ParticipantConnected, onParticipantConnected);
+      room.off(RoomEvent.ParticipantDisconnected, onParticipantDisconnected);
+    };
+  }, [room]);
+
+  return null;
+}
